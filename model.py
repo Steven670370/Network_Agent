@@ -1,14 +1,29 @@
-from typing import TypedDict, List, Dict, Optional
+from __future__ import annotations
+
+from typing import List, Dict, Optional, Literal
+from pydantic import BaseModel, Field, ValidationError
 from langchain.chat_models import ChatOpenAI
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 
 from dotenv import load_dotenv
+
 import os
 import json
+import requests
+import re
+import ipaddress
+import logging
+
+# =========================================================
+# Init
+# =========================================================
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+
 api_key = os.getenv("OPENAI_API_KEY")
+
 if not api_key:
     raise ValueError("Set OPENAI_API_KEY in .env file")
 
@@ -16,21 +31,23 @@ llm = ChatOpenAI(
     openai_api_key=api_key,
     openai_api_base="https://api.deepseek.com",
     model_name="deepseek-code",
-    temperature=0.7
+    temperature=0.3
 )
 
-
-# =========================
+# =========================================================
 # Models
-# =========================
+# =========================================================
 
-class Interface(TypedDict):
+StatusType = Literal["up", "down"]
+
+
+class Interface(BaseModel):
     name: str
     ip: str
-    status: str
+    status: StatusType
 
 
-class Device(TypedDict):
+class Device(BaseModel):
     id: str
     hostname: str
     type: str
@@ -38,90 +55,167 @@ class Device(TypedDict):
     mac: str
     vendor: str
     os: str
-    status: str
+    status: StatusType
     interfaces: List[Interface]
 
 
-class Link(TypedDict):
-    source: str          # Device.id
-    target: str          # Device.id
-    source_port: str     # Interface.name
-    target_port: str     # Interface.name
+class Link(BaseModel):
+    source: str
+    target: str
+    source_port: str
+    target_port: str
     bandwidth: str
     latency_ms: int
-    status: str
+    status: StatusType
 
 
-class Message(TypedDict):
+class Message(BaseModel):
     timestamp: str
     level: str
     source: str
     content: str
 
 
-class ValidationResult(TypedDict):
-    valid: bool
-    errors: List[str]
-    warnings: List[str]
+class ValidationResult(BaseModel):
+    valid: bool = True
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
 
-class NetworkState(TypedDict):
+class NetworkState(BaseModel):
     user_request: str
-    devices: List[Device]
-    links: List[Link]
-    configs: Dict[str, object]
-    messages: List[Message]
-    validation_result: ValidationResult
+    devices: List[Device] = Field(default_factory=list)
+    links: List[Link] = Field(default_factory=list)
+    messages: List[Message] = Field(default_factory=list)
+    validation_result: ValidationResult = Field(
+        default_factory=ValidationResult
+    )
 
 
-# =========================
+# =========================================================
+# GNS3
+# =========================================================
+
+BASE = "http://localhost:3080/v2/projects"
+
+TEMPLATES = {
+    "router": {
+        "template_id": "ROUTER_TEMPLATE_ID",
+        "ports": 8
+    },
+    "switch": {
+        "template_id": "SWITCH_TEMPLATE_ID",
+        "ports": 24
+    },
+    "pc": {
+        "template_id": "VPCS_TEMPLATE_ID",
+        "ports": 1
+    }
+}
+
+# =========================================================
+# Helpers
+# =========================================================
+
+
+def extract_json(text: str) -> dict:
+    """
+    Extract JSON from LLM response.
+    """
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+
+    if not match:
+        raise ValueError("No JSON object found")
+
+    return json.loads(match.group())
+
+
+def safe_request(method, url, **kwargs):
+    """
+    Safe HTTP request.
+    """
+
+    kwargs.setdefault("timeout", 10)
+
+    try:
+        response = requests.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response
+
+    except requests.RequestException as e:
+        raise RuntimeError(f"HTTP request failed: {e}")
+
+
+def normalize_topology(data: dict) -> tuple[List[Device], List[Link]]:
+    """
+    Convert raw JSON into validated Pydantic models.
+    """
+
+    devices = [Device(**d) for d in data["devices"]]
+    links = [Link(**l) for l in data["links"]]
+
+    return devices, links
+
+
+def interface_exists(device: Device, interface_name: str) -> bool:
+    return any(i.name == interface_name for i in device.interfaces)
+
+
+# =========================================================
 # Generate
-# =========================
+# =========================================================
+
 
 def generate_topology(state: NetworkState) -> NetworkState:
-    has_existing_devices = bool(state["devices"])
 
     prompt = f"""
 You are a network topology designer.
 
-Generate a network topology based on these requests
-{"and existing devices only" if has_existing_devices else ""}:
+Generate a realistic topology.
 
-{state["user_request"]}
+Requirements:
+- Return ONLY valid JSON
+- Do not include markdown
+- Device IDs must be unique
+- MAC addresses must be unique
+- IP addresses must be unique
+- Link source/target must reference existing device IDs
+- Interface names must exist on devices
+- Allowed status values: up/down
 
-{"Devices:" + json.dumps(state["devices"], indent=2) if has_existing_devices else "No existing devices."}
+User request:
+{state.user_request}
 
-Return ONLY valid JSON.
+JSON format:
 
-Format:
 {{
   "devices": [
     {{
-      "id": "...",
-      "hostname": "...",
-      "type": "...",
-      "ip": "...",
-      "mac": "...",
-      "vendor": "...",
-      "os": "...",
-      "status": "...",
+      "id": "R1",
+      "hostname": "router1",
+      "type": "router",
+      "ip": "10.0.0.1",
+      "mac": "00:11:22:33:44:55",
+      "vendor": "Cisco",
+      "os": "IOS",
+      "status": "up",
       "interfaces": [
         {{
-          "name": "...",
-          "ip": "...",
+          "name": "Gig0/0",
+          "ip": "192.168.1.1",
           "status": "up"
         }}
       ]
     }}
   ],
-
   "links": [
     {{
-      "source": "...",
-      "target": "...",
-      "source_port": "...",
-      "target_port": "...",
-      "bandwidth": "...",
+      "source": "R1",
+      "target": "SW1",
+      "source_port": "Gig0/0",
+      "target_port": "Gig0/1",
+      "bandwidth": "1Gbps",
       "latency_ms": 1,
       "status": "up"
     }}
@@ -129,220 +223,563 @@ Format:
 }}
 """
 
-    response = llm.predict(prompt)
-    data = json.loads(response)
+    try:
 
-    if not state["devices"]:
-        state["devices"] = data["devices"]
+        response = llm.predict(prompt)
 
-    state["links"] = data["links"]
+        data = extract_json(response)
+
+        devices, links = normalize_topology(data)
+
+        state.devices = devices
+        state.links = links
+
+    except Exception as e:
+
+        state.validation_result.valid = False
+        state.validation_result.errors.append(
+            f"Generation failed: {str(e)}"
+        )
 
     return state
 
 
-# =========================
+# =========================================================
 # Validate
-# =========================
+# =========================================================
+
 
 def validate_topology(state: NetworkState) -> NetworkState:
 
-    validation_result: ValidationResult = {
-        "valid": True,
-        "errors": [],
-        "warnings": []
-    }
-
-    # -------------------------
-    # Device map
-    # -------------------------
+    result = ValidationResult()
 
     device_map = {
-        device["id"]: device
-        for device in state["devices"]
+        d.id: d
+        for d in state.devices
     }
 
-    # -------------------------
+    used_ips = set()
+    used_macs = set()
+    seen_links = set()
+
+    # -----------------------------------------------------
     # Validate devices
-    # -------------------------
+    # -----------------------------------------------------
 
-    for device in state["devices"]:
+    for device in state.devices:
 
-        if device["status"] not in ["up", "down"]:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Device {device['id']} has invalid status {device['status']}."
+        # IP uniqueness
+
+        if device.ip in used_ips:
+            result.valid = False
+            result.errors.append(
+                f"Duplicate device IP: {device.ip}"
             )
+
+        used_ips.add(device.ip)
+
+        # MAC uniqueness
+
+        if device.mac in used_macs:
+            result.valid = False
+            result.errors.append(
+                f"Duplicate MAC address: {device.mac}"
+            )
+
+        used_macs.add(device.mac)
+
+        # Validate IP format
+
+        try:
+            ipaddress.ip_address(device.ip)
+        except ValueError:
+            result.valid = False
+            result.errors.append(
+                f"Invalid device IP: {device.ip}"
+            )
+
+        # Interface validation
 
         interface_names = set()
 
-        for interface in device["interfaces"]:
+        for interface in device.interfaces:
 
-            # duplicate interface names
-            if interface["name"] in interface_names:
-                validation_result["valid"] = False
-                validation_result["errors"].append(
-                    f"Duplicate interface {interface['name']} on device {device['id']}."
+            if interface.name in interface_names:
+                result.valid = False
+                result.errors.append(
+                    f"Duplicate interface "
+                    f"{interface.name} on {device.id}"
                 )
 
-            interface_names.add(interface["name"])
+            interface_names.add(interface.name)
 
-            # validate interface status
-            if interface["status"] not in ["up", "down"]:
-                validation_result["valid"] = False
-                validation_result["errors"].append(
-                    f"Interface {interface['name']} on device {device['id']} "
-                    f"has invalid status {interface['status']}."
+            if interface.ip in used_ips:
+                result.valid = False
+                result.errors.append(
+                    f"Duplicate interface IP: {interface.ip}"
                 )
 
-    # -------------------------
+            used_ips.add(interface.ip)
+
+            try:
+                ipaddress.ip_address(interface.ip)
+            except ValueError:
+                result.valid = False
+                result.errors.append(
+                    f"Invalid interface IP: {interface.ip}"
+                )
+
+    # -----------------------------------------------------
     # Validate links
-    # -------------------------
+    # -----------------------------------------------------
 
     connected_devices = set()
 
-    for link in state["links"]:
+    for link in state.links:
 
-        source_id = link["source"]
-        target_id = link["target"]
+        if link.source == link.target:
+            result.valid = False
+            result.errors.append(
+                f"Self-loop link on {link.source}"
+            )
 
-        connected_devices.add(source_id)
-        connected_devices.add(target_id)
+        pair = tuple(sorted([link.source, link.target]))
 
-        # validate source device exists
-        if source_id not in device_map:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Link source device {source_id} does not exist."
+        if pair in seen_links:
+            result.valid = False
+            result.errors.append(
+                f"Duplicate link between "
+                f"{link.source} and {link.target}"
+            )
+
+        seen_links.add(pair)
+
+        # Device existence
+
+        if link.source not in device_map:
+            result.valid = False
+            result.errors.append(
+                f"Missing source device: {link.source}"
             )
             continue
 
-        # validate target device exists
-        if target_id not in device_map:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Link target device {target_id} does not exist."
+        if link.target not in device_map:
+            result.valid = False
+            result.errors.append(
+                f"Missing target device: {link.target}"
             )
             continue
 
-        source_device = device_map[source_id]
-        target_device = device_map[target_id]
+        connected_devices.add(link.source)
+        connected_devices.add(link.target)
 
-        source_interfaces = {
-            interface["name"]
-            for interface in source_device["interfaces"]
-        }
+        source_device = device_map[link.source]
+        target_device = device_map[link.target]
 
-        target_interfaces = {
-            interface["name"]
-            for interface in target_device["interfaces"]
-        }
-
-        # validate source port exists
-        if link["source_port"] not in source_interfaces:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Source port {link['source_port']} does not exist "
-                f"on device {source_id}."
+        if not interface_exists(
+            source_device,
+            link.source_port
+        ):
+            result.valid = False
+            result.errors.append(
+                f"Source port {link.source_port} "
+                f"missing on {link.source}"
             )
 
-        # validate target port exists
-        if link["target_port"] not in target_interfaces:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Target port {link['target_port']} does not exist "
-                f"on device {target_id}."
+        if not interface_exists(
+            target_device,
+            link.target_port
+        ):
+            result.valid = False
+            result.errors.append(
+                f"Target port {link.target_port} "
+                f"missing on {link.target}"
             )
 
-        # validate link status
-        if link["status"] not in ["up", "down"]:
-            validation_result["valid"] = False
-            validation_result["errors"].append(
-                f"Link {source_id} -> {target_id} "
-                f"has invalid status {link['status']}."
+    # -----------------------------------------------------
+    # Isolated devices
+    # -----------------------------------------------------
+
+    for device in state.devices:
+
+        if device.id not in connected_devices:
+            result.warnings.append(
+                f"Isolated device: {device.id}"
             )
 
-    # -------------------------
-    # Check isolated devices
-    # -------------------------
-
-    for device in state["devices"]:
-
-        if device["id"] not in connected_devices:
-            validation_result["warnings"].append(
-                f"Device {device['id']} is not connected to any links."
-            )
-
-    # save result
-    state["validation_result"] = validation_result
+    state.validation_result = result
 
     return state
 
 
-# =========================
-# Rebuild
-# =========================
+# =========================================================
+# Repair
+# =========================================================
 
-def rebuild_topology(state: NetworkState) -> NetworkState:
 
-    prompt = f"""
-You are a network topology rebuilder.
+def repair_topology(state: NetworkState) -> NetworkState:
+    """
+    Deterministic repair.
+    No LLM regeneration.
+    """
 
-Rebuild the following network topology to fix these issues.
+    device_map = {
+        d.id: d
+        for d in state.devices
+    }
 
-User Request:
-{state["user_request"]}
+    # -----------------------------------------------------
+    # Fix duplicate interface names
+    # -----------------------------------------------------
 
-Validation Result:
-{json.dumps(state["validation_result"], indent=2)}
+    for device in state.devices:
 
-Devices:
-{json.dumps(state["devices"], indent=2)}
+        used = set()
 
-Links:
-{json.dumps(state["links"], indent=2)}
+        for idx, interface in enumerate(device.interfaces):
 
-Return ONLY valid JSON.
+            if interface.name in used:
 
-Format:
-{{
-  "devices": [
-    {{
-      "id": "...",
-      "hostname": "...",
-      "type": "...",
-      "ip": "...",
-      "mac": "...",
-      "vendor": "...",
-      "os": "...",
-      "status": "...",
-      "interfaces": [
-        {{
-          "name": "...",
-          "ip": "...",
-          "status": "up"
-        }}
-      ]
-    }}
-  ],
+                interface.name = f"{interface.name}_{idx}"
 
-  "links": [
-    {{
-      "source": "...",
-      "target": "...",
-      "source_port": "...",
-      "target_port": "...",
-      "bandwidth": "...",
-      "latency_ms": 1,
-      "status": "up"
-    }}
-  ]
-}}
-"""
+            used.add(interface.name)
 
-    response = llm.predict(prompt)
-    data = json.loads(response)
+    # -----------------------------------------------------
+    # Fix invalid link ports
+    # -----------------------------------------------------
 
-    state["devices"] = data["devices"]
-    state["links"] = data["links"]
+    for link in state.links:
+
+        if link.source in device_map:
+
+            source_device = device_map[link.source]
+
+            if not interface_exists(
+                source_device,
+                link.source_port
+            ):
+                link.source_port = (
+                    source_device.interfaces[0].name
+                )
+
+        if link.target in device_map:
+
+            target_device = device_map[link.target]
+
+            if not interface_exists(
+                target_device,
+                link.target_port
+            ):
+                link.target_port = (
+                    target_device.interfaces[0].name
+                )
+
+    # -----------------------------------------------------
+    # Remove self-loop links
+    # -----------------------------------------------------
+
+    state.links = [
+        link for link in state.links
+        if link.source != link.target
+    ]
+
+    # -----------------------------------------------------
+    # Force valid statuses
+    # -----------------------------------------------------
+
+    for device in state.devices:
+
+        if device.status not in ["up", "down"]:
+            device.status = "up"
+
+        for interface in device.interfaces:
+
+            if interface.status not in ["up", "down"]:
+                interface.status = "up"
+
+    for link in state.links:
+
+        if link.status not in ["up", "down"]:
+            link.status = "up"
 
     return state
+
+
+# =========================================================
+# LangGraph Condition
+# =========================================================
+
+
+def topology_is_valid(state: NetworkState):
+
+    return (
+        "valid"
+        if state.validation_result.valid
+        else "invalid"
+    )
+
+
+# =========================================================
+# Deploy
+# =========================================================
+
+
+def create_graph_in_gns3(state: NetworkState) -> NetworkState:
+
+    project_id = None
+
+    try:
+
+        # -------------------------------------------------
+        # Create project
+        # -------------------------------------------------
+
+        response = safe_request(
+            "POST",
+            BASE,
+            json={"name": "AutoProject"}
+        )
+
+        project = response.json()
+
+        project_id = project["project_id"]
+
+        project_base = f"{BASE}/{project_id}"
+
+        logging.info(f"Project created: {project_id}")
+
+        # -------------------------------------------------
+        # Create nodes
+        # -------------------------------------------------
+
+        node_mapping = {}
+
+        interface_mapping = {}
+
+        for idx, device in enumerate(state.devices):
+
+            if device.type not in TEMPLATES:
+                raise ValueError(
+                    f"Unknown device type: {device.type}"
+                )
+
+            template = TEMPLATES[device.type]
+
+            node_data = {
+                "name": device.hostname,
+                "template_id": template["template_id"],
+                "x": idx * 100,
+                "y": 0
+            }
+
+            response = safe_request(
+                "POST",
+                f"{project_base}/nodes",
+                json=node_data
+            )
+
+            node = response.json()
+
+            node_mapping[device.id] = node["node_id"]
+
+            # Interface -> port mapping
+
+            interface_mapping[device.id] = {}
+
+            for port_idx, interface in enumerate(
+                device.interfaces
+            ):
+
+                interface_mapping[device.id][
+                    interface.name
+                ] = port_idx
+
+            logging.info(
+                f"Node created: {device.hostname}"
+            )
+
+        # -------------------------------------------------
+        # Create links
+        # -------------------------------------------------
+
+        for link in state.links:
+
+            src_node = node_mapping[link.source]
+            dst_node = node_mapping[link.target]
+
+            src_port = interface_mapping[
+                link.source
+            ][link.source_port]
+
+            dst_port = interface_mapping[
+                link.target
+            ][link.target_port]
+
+            link_data = {
+                "nodes": [
+                    {
+                        "node_id": src_node,
+                        "adapter_number": 0,
+                        "port_number": src_port
+                    },
+                    {
+                        "node_id": dst_node,
+                        "adapter_number": 0,
+                        "port_number": dst_port
+                    }
+                ]
+            }
+
+            safe_request(
+                "POST",
+                f"{project_base}/links",
+                json=link_data
+            )
+
+            logging.info(
+                f"Linked "
+                f"{link.source}:{link.source_port} "
+                f"<-> "
+                f"{link.target}:{link.target_port}"
+            )
+
+    except Exception as e:
+
+        logging.error(f"Deployment failed: {e}")
+
+        state.validation_result.valid = False
+        state.validation_result.errors.append(
+            f"GNS3 deployment failed: {str(e)}"
+        )
+
+        # rollback
+
+        if project_id:
+
+            try:
+
+                safe_request(
+                    "DELETE",
+                    f"{BASE}/{project_id}"
+                )
+
+                logging.info(
+                    f"Rollback project {project_id}"
+                )
+
+            except Exception as rollback_error:
+
+                logging.error(
+                    f"Rollback failed: {rollback_error}"
+                )
+
+    return state
+
+
+# =========================================================
+# Build LangGraph
+# =========================================================
+
+workflow = StateGraph(NetworkState)
+
+workflow.add_node(
+    "generate",
+    generate_topology
+)
+
+workflow.add_node(
+    "validate",
+    validate_topology
+)
+
+workflow.add_node(
+    "repair",
+    repair_topology
+)
+
+workflow.add_node(
+    "deploy",
+    create_graph_in_gns3
+)
+
+workflow.set_entry_point("generate")
+
+workflow.add_edge(
+    "generate",
+    "validate"
+)
+
+workflow.add_conditional_edges(
+    "validate",
+    topology_is_valid,
+    {
+        "valid": "deploy",
+        "invalid": "repair"
+    }
+)
+
+workflow.add_edge(
+    "repair",
+    "validate"
+)
+
+workflow.add_edge(
+    "deploy",
+    END
+)
+
+app = workflow.compile()
+
+# =========================================================
+# Run
+# =========================================================
+
+if __name__ == "__main__":
+
+    initial_state = NetworkState(
+        user_request=(
+            "Create a topology with "
+            "2 routers, 1 switch, and 2 PCs"
+        )
+    )
+
+    final_state = app.invoke(initial_state)
+
+    print("\n==============================")
+    print("VALIDATION")
+    print("==============================")
+
+    print(
+        json.dumps(
+            final_state["validation_result"].dict(),
+            indent=2
+        )
+    )
+
+    print("\n==============================")
+    print("DEVICES")
+    print("==============================")
+
+    print(
+        json.dumps(
+            [
+                d.dict()
+                for d in final_state["devices"]
+            ],
+            indent=2
+        )
+    )
+
+    print("\n==============================")
+    print("LINKS")
+    print("==============================")
+
+    print(
+        json.dumps(
+            [
+                l.dict()
+                for l in final_state["links"]
+            ],
+            indent=2
+        )
+    )
