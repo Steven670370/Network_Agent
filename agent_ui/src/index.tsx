@@ -1,10 +1,9 @@
 import dotenv from "dotenv";
     dotenv.config();
 import React, { useState, useRef } from "react";
-import { render, Box, Text, useApp } from "ink";
+import { render, Box, Text, useApp, useStdout } from "ink";
 import TextInput from "ink-text-input";
 import { askStream } from "./llm.js";
-import useStdoutDimensions from "ink-use-stdout-dimensions";
 
 const questions: string[] = [];
 let inkInstance: ReturnType<typeof render> | null = null;
@@ -35,11 +34,14 @@ function App() {
         { id: number; role: string; content: string }[]
     >([]);
 
-    const [width, height] = useStdoutDimensions();
+    const { stdout } = useStdout();
+    const width = stdout.columns;
+    const height = stdout.rows;
 
     const idRef = useRef(0);
 
     const requestIdRef = useRef(0);
+    const busyRef = useRef(false);
 
     return (
         <Box flexDirection="column" height={height} width={width}>
@@ -61,8 +63,8 @@ function App() {
                 {messages.map((msg) => (
                     <Box key={msg.id}>
                         <Text color={msg.role === "user" ? "blue" : "yellow"}>
-                            {msg.role === "user" ? "User" : "Agent"}:
-                        </Text>{" "}
+                            {msg.role === "user" ? "User: " : "Agent: "}
+                        </Text>
                         <Text>{msg.content}</Text>
                     </Box>
                 ))}
@@ -83,6 +85,9 @@ function App() {
                             handleExit(exit);
                             return;
                         }
+
+                        if (busyRef.current) return;
+                        busyRef.current = true;
 
                         setStatus("thinking");
 
@@ -141,8 +146,10 @@ function App() {
                             }
 
                             setStatus("idle");
+                            busyRef.current = false;
                         } catch (error) {
                             setStatus("error");
+                            busyRef.current = false;
 
                             setMessages((prev) =>
                                 prev.map((msg) =>
@@ -161,17 +168,7 @@ function App() {
 }
 
 const instance = render(<App />, {
-    alternateScreen: true,
-    exitOnCtrlC: false
+    exitOnCtrlC: true
 });
 
 inkInstance = instance;
-
-process.stdin.setRawMode?.(true);
-process.stdin.resume();
-
-process.stdin.on("data", (data) => {
-    if (data.toString() === "\x03") {
-        handleExit(() => inkInstance?.unmount());
-    }
-});
